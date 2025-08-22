@@ -49,7 +49,7 @@ def after_request(response):
 # =========================
 # Global Model Variables
 # =========================
-MODEL_NAME = "facebook/wav2vec2-tiny"
+MODEL_NAME = "facebook/wav2vec2-base-960h"
 processor = None
 model = None
 model_loaded = False
