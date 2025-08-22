@@ -13,7 +13,12 @@ import os
 import tempfile
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=[
+    "https://voicetranscript-gm1e.vercel.app",
+    "https://voicetranscript.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:3000"
+], supports_credentials=True)
 
 print("Loading Whisper model...")
 processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
