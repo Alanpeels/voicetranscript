@@ -15,19 +15,29 @@ import gc
 
 app = Flask(__name__)
 
-# More comprehensive CORS configuration
+# Configure CORS properly
 CORS(app, 
      origins=["*"],  # Allow all origins for now
      methods=["GET", "POST", "OPTIONS"],
-     allow_headers=["Content-Type", "Authorization"],
+     allow_headers=["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"],
      supports_credentials=False)
 
-# Add CORS headers manually as backup
+# Handle preflight requests globally
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = jsonify({'status': 'ok'})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,Origin,X-Requested-With')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+        return response
+
+# Add CORS headers to all responses
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,Origin,X-Requested-With')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
     return response
 
 # Global variables for model (lazy loading)
@@ -148,13 +158,12 @@ def get_word_timestamps(audio_array, sample_rate):
     
     return word_timestamps
 
-@app.route('/transcribe', methods=['POST', 'OPTIONS'])
-def transcribe_audio():
-    # Handle preflight CORS request
-    if request.method == 'OPTIONS':
-        return jsonify({'status': 'ok'}), 200
-        
+@app.route('/transcribe', methods=['POST'])
+def transcribe_audio():        
     try:
+        print(f"Received request with method: {request.method}")
+        print(f"Request headers: {dict(request.headers)}")
+        
         if 'audio' not in request.files:
             return jsonify({'error': 'No audio file provided'}), 400
         
