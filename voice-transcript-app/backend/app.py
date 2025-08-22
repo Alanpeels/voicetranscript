@@ -13,12 +13,21 @@ import os
 import tempfile
 
 app = Flask(__name__)
-CORS(app, origins=[
-    "https://voicetranscript-gm1e.vercel.app",
-    "https://voicetranscript.vercel.app",
-    "http://localhost:5173",
-    "http://localhost:3000"
-], supports_credentials=True)
+
+# More comprehensive CORS configuration
+CORS(app, 
+     origins=["*"],  # Allow all origins for now
+     methods=["GET", "POST", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization"],
+     supports_credentials=False)
+
+# Add CORS headers manually as backup
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
 
 print("Loading Whisper model...")
 processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
