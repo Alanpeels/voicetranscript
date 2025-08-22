@@ -11,6 +11,7 @@ from datetime import datetime
 import sqlite3
 import os
 import tempfile
+import gc
 
 app = Flask(__name__)
 
@@ -29,10 +30,29 @@ def after_request(response):
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
 
-print("Loading Whisper model...")
-processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
-model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3")
-print("Whisper model loaded successfully!")
+# Global variables for model (lazy loading)
+processor = None
+model = None
+
+def load_model():
+    global processor, model
+    if processor is None or model is None:
+        print("Loading Whisper model...")
+        # Use smaller model to save memory
+        model_name = "openai/whisper-small"  # Changed from whisper-large-v3
+        processor = WhisperProcessor.from_pretrained(model_name)
+        model = WhisperForConditionalGeneration.from_pretrained(model_name)
+        
+        # Move to CPU and set to eval mode to save memory
+        model.eval()
+        
+        print(f"Whisper model {model_name} loaded successfully!")
+
+def clear_memory():
+    """Clear memory after processing"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 def init_db():
     conn = sqlite3.connect('transcripts.db')
@@ -63,14 +83,15 @@ def init_db():
 
 def process_audio_directly(audio_bytes, filename):
     try:
-        audio_array, sample_rate = librosa.load(io.BytesIO(audio_bytes), sr=16000)
+        # Limit audio length to save memory
+        audio_array, sample_rate = librosa.load(io.BytesIO(audio_bytes), sr=16000, duration=300)  # Max 5 minutes
         print(f"Successfully loaded audio directly: {len(audio_array)} samples, {sample_rate}Hz")
         return audio_array, sample_rate
     except Exception as e:
         print(f"Direct loading failed: {str(e)}")
         
         try:
-            audio_array, sample_rate = librosa.load(io.BytesIO(audio_bytes), sr=None)
+            audio_array, sample_rate = librosa.load(io.BytesIO(audio_bytes), sr=None, duration=300)  # Max 5 minutes
             print(f"Loaded with original sample rate: {sample_rate}Hz")
             
             if sample_rate != 16000:
@@ -84,17 +105,27 @@ def process_audio_directly(audio_bytes, filename):
             raise Exception(f"Could not process audio file {filename}. Supported formats: WAV, MP3, OGG, FLAC, M4A")
 
 def get_word_timestamps(audio_array, sample_rate):
+    load_model()  # Lazy load the model
+    
+    # Process in smaller chunks if needed
+    max_length = 16000 * 30  # 30 seconds max at a time
+    if len(audio_array) > max_length:
+        audio_array = audio_array[:max_length]
+        print(f"Truncated audio to 30 seconds to save memory")
+    
     inputs = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt")
     
-    predicted_ids = model.generate(
-        inputs["input_features"],
-        return_timestamps=True,
-        output_scores=True
-    )
+    with torch.no_grad():  # Don't compute gradients to save memory
+        predicted_ids = model.generate(
+            inputs["input_features"],
+            return_timestamps=True,
+            max_length=448,  # Limit output length
+            num_beams=1,     # Use greedy decoding to save memory
+        )
     
     transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
     
-    # Approximate word timestamps (Whisper doesn't provide exact word-level timestamps)
+    # Approximate word timestamps
     words = transcription.split()
     word_timestamps = []
     
@@ -111,16 +142,28 @@ def get_word_timestamps(audio_array, sample_rate):
             "end": round(end_time, 3)
         })
     
+    # Clear memory after processing
+    del inputs, predicted_ids
+    clear_memory()
+    
     return word_timestamps
 
-@app.route('/transcribe', methods=['POST'])
+@app.route('/transcribe', methods=['POST', 'OPTIONS'])
 def transcribe_audio():
+    # Handle preflight CORS request
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+        
     try:
         if 'audio' not in request.files:
             return jsonify({'error': 'No audio file provided'}), 400
         
         audio_file = request.files['audio']
         audio_bytes = audio_file.read()
+        
+        # Check file size (limit to 10MB)
+        if len(audio_bytes) > 10 * 1024 * 1024:
+            return jsonify({'error': 'Audio file too large. Maximum size is 10MB.'}), 400
         
         filename = audio_file.filename or 'audio'
         file_extension = filename.split('.')[-1].lower() if '.' in filename else 'webm'
@@ -141,6 +184,10 @@ def transcribe_audio():
         
         print(f"Transcription completed: {len(word_timestamps)} words")
         
+        # Clear variables to free memory
+        del audio_bytes, audio_array
+        clear_memory()
+        
         return jsonify({
             'success': True,
             'transcript': transcript_text,
@@ -150,15 +197,20 @@ def transcribe_audio():
         
     except Exception as e:
         print(f"Error in transcription: {str(e)}")
+        clear_memory()  # Clear memory even on error
         return jsonify({'error': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({'status': 'healthy', 'model': 'whisper-large-v3'})
+    return jsonify({'status': 'healthy', 'model': 'whisper-small'})
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({'message': 'Voice Transcript API is running', 'endpoints': ['/transcribe', '/health']})
 
 if __name__ == '__main__':
     init_db()
     print("Starting Flask server...")
     # Use the port that Render provides via environment variable
     port = int(os.environ.get('PORT', 5000))
-    app.run(debug=False, host='0.0.0.0', port=port) 
+    app.run(debug=False, host='0.0.0.0', port=port)
