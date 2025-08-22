@@ -1,79 +1,76 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import torch
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 import librosa
 import numpy as np
 import io
-import base64
-import json
+import logging
+import traceback
+import gc
+import os
 from datetime import datetime
 import sqlite3
-import os
-import tempfile
-import gc
-import logging
-import sys
-import traceback
 
-# Set up logging
+# =========================
+# Logging Setup
+# =========================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# =========================
+# Flask App Setup
+# =========================
 app = Flask(__name__)
+CORS(app, origins=["*"], supports_credentials=False)
 
-# Configure CORS properly
-CORS(app, 
-     origins=["*"],
-     methods=["GET", "POST", "OPTIONS"],
-     allow_headers=["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"],
-     supports_credentials=False)
-
-# Handle preflight requests globally
 @app.before_request
 def handle_preflight():
     if request.method == "OPTIONS":
         response = jsonify({'status': 'ok'})
         response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,Origin,X-Requested-With')
+        response.headers.add(
+            'Access-Control-Allow-Headers',
+            'Content-Type,Authorization,Accept,Origin,X-Requested-With'
+        )
         response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
         return response
 
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,Origin,X-Requested-With')
+    response.headers.add(
+        'Access-Control-Allow-Headers',
+        'Content-Type,Authorization,Accept,Origin,X-Requested-With'
+    )
     response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
     return response
 
-# Global variables for model (lazy loading)
+# =========================
+# Global Model Variables
+# =========================
+MODEL_NAME = "facebook/wav2vec2-tiny"
 processor = None
 model = None
 model_loaded = False
 model_error = None
 
-def load_model():
+# =========================
+# Utility Functions
+# =========================
+def load_wav2vec2_model():
     global processor, model, model_loaded, model_error
     if model_loaded:
         return True
-        
     try:
-        logger.info("Loading Whisper model...")
-        model_name = "openai/whisper-small"
-        
-        # Check available memory
-        import psutil
-        memory = psutil.virtual_memory()
-        logger.info(f"Available memory: {memory.available / 1024**3:.2f} GB")
-        
-        processor = WhisperProcessor.from_pretrained(model_name)
-        model = WhisperForConditionalGeneration.from_pretrained(model_name)
+        logger.info(f"Loading model: {MODEL_NAME} ...")
+        processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+        model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME)
         model.eval()
-        
+        model = model.to('cpu')
         model_loaded = True
-        logger.info(f"Whisper model {model_name} loaded successfully!")
+        logger.info(f"Model {MODEL_NAME} loaded successfully")
         return True
-        
     except Exception as e:
         model_error = str(e)
         logger.error(f"Failed to load model: {e}")
@@ -81,225 +78,178 @@ def load_model():
         return False
 
 def clear_memory():
-    """Clear memory after processing"""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+def process_audio(audio_bytes, max_duration=30):
+    """Load audio and convert to 16kHz"""
+    try:
+        audio_array, sr = librosa.load(io.BytesIO(audio_bytes), sr=16000, duration=max_duration)
+        logger.info(f"Audio loaded: {len(audio_array)} samples at {sr}Hz")
+        return audio_array, sr
+    except Exception as e:
+        logger.error(f"Audio processing failed: {e}")
+        raise Exception("Could not process audio")
+
+def transcribe(audio_array, sample_rate):
+    if not load_wav2vec2_model():
+        raise Exception(f"Model load failed: {model_error}")
+    try:
+        # Preprocess
+        inputs = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt", padding=True)
+        with torch.no_grad():
+            logits = model(inputs.input_values).logits
+        predicted_ids = torch.argmax(logits, dim=-1)
+        transcription = processor.batch_decode(predicted_ids)[0]
+        
+        # Estimate simple word-level timestamps
+        hop_length = 320
+        time_per_frame = hop_length / sample_rate
+        words = transcription.split()
+        word_timestamps = []
+        if words:
+            frame_count = logits.shape[1]
+            total_duration = frame_count * time_per_frame
+            words_per_second = len(words) / total_duration if total_duration > 0 else 0
+            for i, word in enumerate(words):
+                start_time = i / words_per_second if words_per_second > 0 else 0
+                end_time = (i + 1) / words_per_second if words_per_second > 0 else 0
+                word_timestamps.append({
+                    "word": word,
+                    "start": round(start_time, 3),
+                    "end": round(end_time, 3),
+                    "confidence": 0.8
+                })
+        del inputs, logits, predicted_ids
+        clear_memory()
+        return transcription, word_timestamps
+    except Exception as e:
+        clear_memory()
+        logger.error(f"Transcription failed: {e}")
+        raise
+
+# =========================
+# Database
+# =========================
+DB_FILE = 'transcripts.db'
+
 def init_db():
     try:
-        conn = sqlite3.connect('transcripts.db')
+        conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS transcripts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
                 audio_filename TEXT,
                 transcript_text TEXT,
                 word_timestamps TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (id)
+                model_used TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         conn.commit()
         conn.close()
-        logger.info("Database initialized successfully")
+        logger.info("Database initialized")
     except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
+        logger.error(f"DB init failed: {e}")
 
-def process_audio_directly(audio_bytes, filename):
-    try:
-        # Limit audio length to save memory
-        audio_array, sample_rate = librosa.load(io.BytesIO(audio_bytes), sr=16000, duration=60)  # Reduced to 1 minute
-        logger.info(f"Successfully loaded audio directly: {len(audio_array)} samples, {sample_rate}Hz")
-        return audio_array, sample_rate
-    except Exception as e:
-        logger.error(f"Direct loading failed: {str(e)}")
-        
-        try:
-            audio_array, sample_rate = librosa.load(io.BytesIO(audio_bytes), sr=None, duration=60)
-            logger.info(f"Loaded with original sample rate: {sample_rate}Hz")
-            
-            if sample_rate != 16000:
-                audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
-                sample_rate = 16000
-                logger.info(f"Resampled to 16kHz")
-            
-            return audio_array, sample_rate
-        except Exception as e2:
-            logger.error(f"Fallback loading also failed: {str(e2)}")
-            raise Exception(f"Could not process audio file {filename}. Supported formats: WAV, MP3, OGG, FLAC, M4A")
-
-def get_word_timestamps(audio_array, sample_rate):
-    if not load_model():
-        raise Exception(f"Model loading failed: {model_error}")
-    
-    # Process in smaller chunks if needed
-    max_length = 16000 * 30  # 30 seconds max
-    if len(audio_array) > max_length:
-        audio_array = audio_array[:max_length]
-        logger.info(f"Truncated audio to 30 seconds")
-    
-    try:
-        inputs = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt")
-        
-        with torch.no_grad():
-            predicted_ids = model.generate(
-                inputs["input_features"],
-                return_timestamps=True,
-                max_length=224,  # Reduced further
-                num_beams=1,
-            )
-        
-        transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-        
-        # Approximate word timestamps
-        words = transcription.split()
-        word_timestamps = []
-        
-        duration = len(audio_array) / sample_rate
-        words_per_second = len(words) / duration if duration > 0 else 0
-        
-        for i, word in enumerate(words):
-            start_time = i / words_per_second if words_per_second > 0 else 0
-            end_time = (i + 1) / words_per_second if words_per_second > 0 else 0
-            
-            word_timestamps.append({
-                "word": word,
-                "start": round(start_time, 3),
-                "end": round(end_time, 3)
-            })
-        
-        # Clear memory after processing
-        del inputs, predicted_ids
-        clear_memory()
-        
-        return word_timestamps
-        
-    except Exception as e:
-        logger.error(f"Transcription failed: {e}")
-        clear_memory()
-        raise
-
+# =========================
+# Routes
+# =========================
 @app.route('/transcribe', methods=['POST'])
-def transcribe_audio():        
+def transcribe_route():
     try:
-        logger.info(f"Received transcription request")
-        
         if 'audio' not in request.files:
             return jsonify({'error': 'No audio file provided'}), 400
-        
         audio_file = request.files['audio']
         audio_bytes = audio_file.read()
-        
-        # Check file size (reduced limit for free tier)
-        if len(audio_bytes) > 5 * 1024 * 1024:  # 5MB limit
-            return jsonify({'error': 'Audio file too large. Maximum size is 5MB.'}), 400
-        
-        filename = audio_file.filename or 'audio'
-        file_extension = filename.split('.')[-1].lower() if '.' in filename else 'webm'
-        
-        logger.info(f"Processing audio file: {filename} (format: {file_extension})")
-        logger.info(f"Audio file size: {len(audio_bytes)} bytes")
-        
-        audio_array, sample_rate = process_audio_directly(audio_bytes, filename)
-        
-        logger.info(f"Audio loaded: {len(audio_array)} samples, {sample_rate}Hz sample rate")
-        
-        word_timestamps = get_word_timestamps(audio_array, sample_rate)
-        
-        transcript_text = " ".join([word['word'] for word in word_timestamps])
-        
+        if len(audio_bytes) > 5 * 1024 * 1024:
+            return jsonify({'error': 'Audio file too large (max 5MB)'}), 400
+        audio_array, sr = process_audio(audio_bytes, max_duration=30)
+        transcript, word_timestamps = transcribe(audio_array, sr)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         audio_filename = f"audio_{timestamp}.wav"
         
-        logger.info(f"Transcription completed: {len(word_timestamps)} words")
+        # Store in DB
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO transcripts (audio_filename, transcript_text, word_timestamps, model_used)
+                VALUES (?, ?, ?, ?)
+            ''', (audio_filename, transcript, str(word_timestamps), MODEL_NAME))
+            conn.commit()
+            conn.close()
+        except Exception as db_err:
+            logger.warning(f"DB insert failed: {db_err}")
         
-        # Clear variables to free memory
         del audio_bytes, audio_array
         clear_memory()
         
         return jsonify({
             'success': True,
-            'transcript': transcript_text,
+            'transcript': transcript,
             'word_timestamps': word_timestamps,
-            'audio_filename': audio_filename
+            'audio_filename': audio_filename,
+            'model_used': MODEL_NAME,
+            'word_count': len(word_timestamps)
         })
-        
     except Exception as e:
-        logger.error(f"Error in transcription: {str(e)}")
         logger.error(traceback.format_exc())
-        clear_memory()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
     try:
-        # Check memory usage
-        import psutil
-        memory = psutil.virtual_memory()
+        memory_info = {}
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            memory_info = {
+                'memory_usage': f"{mem.percent}%",
+                'available_memory': f"{mem.available / 1024**3:.2f} GB"
+            }
+        except ImportError:
+            memory_info = {'memory_info': 'unavailable'}
         
         status = {
             'status': 'healthy',
-            'model': 'whisper-small',
+            'model': MODEL_NAME,
             'model_loaded': model_loaded,
-            'memory_usage': f"{memory.percent}%",
-            'available_memory': f"{memory.available / 1024**3:.2f} GB"
+            **memory_info
         }
-        
         if model_error:
             status['model_error'] = model_error
-            
         return jsonify(status)
-        
     except Exception as e:
-        return jsonify({
-            'status': 'unhealthy',
-            'error': str(e)
-        }), 500
+        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def home():
-    try:
-        return jsonify({
-            'message': 'Voice Transcript API is running', 
-            'endpoints': ['/transcribe', '/health'],
-            'status': 'ready'
-        })
-    except Exception as e:
-        logger.error(f"Error in home route: {e}")
-        return jsonify({'error': 'Service temporarily unavailable'}), 500
+    return jsonify({
+        'message': 'Wav2Vec2 Tiny ASR API running',
+        'endpoints': ['/transcribe', '/health'],
+        'status': 'ready',
+        'model': MODEL_NAME
+    })
 
-# Error handlers
+# =========================
+# Error Handlers
+# =========================
 @app.errorhandler(500)
 def internal_error(error):
-    logger.error(f"Internal server error: {error}")
     return jsonify({'error': 'Internal server error'}), 500
 
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({'error': 'Endpoint not found'}), 404
 
+# =========================
+# Main
+# =========================
 if __name__ == '__main__':
-    try:
-        init_db()
-        logger.info("Starting Flask server...")
-        port = int(os.environ.get('PORT', 5000))
-        
-        # Don't preload the model on startup to avoid timeout
-        logger.info(f"Server starting on port {port}")
-        app.run(debug=False, host='0.0.0.0', port=port)
-        
-    except Exception as e:
-        logger.error(f"Failed to start server: {e}")
-        sys.exit(1)
+    init_db()
+    port = int(os.environ.get('PORT', 5000))
+    logger.info(f"Starting server on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
