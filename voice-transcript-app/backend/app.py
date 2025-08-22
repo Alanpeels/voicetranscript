@@ -150,4 +150,6 @@ def health_check():
 if __name__ == '__main__':
     init_db()
     print("Starting Flask server...")
-    app.run(debug=True, host='0.0.0.0', port=5000) 
+    # Use the port that Render provides via environment variable
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=False, host='0.0.0.0', port=port) 
