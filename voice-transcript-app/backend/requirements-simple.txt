@@ -1,8 +1,0 @@
-flask
-flask-cors
-torch
-transformers
-librosa
-numpy
-scipy
-soundfile 
