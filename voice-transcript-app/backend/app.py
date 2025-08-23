@@ -7,7 +7,7 @@ from datetime import datetime
 import sqlite3
 
 from flask import Flask, request, jsonify, make_response
-from flask_cors import CORS, cross_origin
+from flask_cors import CORS
 
 # Set up proper logging
 logging.basicConfig(
@@ -19,14 +19,14 @@ logger = logging.getLogger(__name__)
 # Create Flask app
 app = Flask(__name__)
 
-# Configure CORS - be very explicit
-app.config['CORS_HEADERS'] = 'Content-Type'
-CORS(app, 
-     origins=['*'],
-     methods=['GET', 'POST', 'OPTIONS'],
-     allow_headers=['Content-Type', 'Authorization', 'Accept', 'Origin', 'X-Requested-With'],
-     expose_headers=['Content-Type'],
-     supports_credentials=False)
+# Simplified CORS configuration - this is the most important fix
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"]
+    }
+})
 
 # Global model variables
 processor = None
@@ -143,33 +143,17 @@ def simple_transcribe(audio_bytes):
         clear_memory()
         raise
 
-# Routes with explicit CORS
-@app.route('/', methods=['GET', 'OPTIONS'])
-@cross_origin()
+# Routes - simplified without manual CORS handling
+@app.route('/', methods=['GET'])
 def home():
-    if request.method == 'OPTIONS':
-        response = make_response()
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add('Access-Control-Allow-Headers', "*")
-        response.headers.add('Access-Control-Allow-Methods', "*")
-        return response
-    
     return jsonify({
         'message': 'Wav2Vec2 ASR API',
         'endpoints': ['/transcribe', '/health'],
         'status': 'running'
     })
 
-@app.route('/health', methods=['GET', 'OPTIONS'])
-@cross_origin()
+@app.route('/health', methods=['GET'])
 def health():
-    if request.method == 'OPTIONS':
-        response = make_response()
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add('Access-Control-Allow-Headers', "*")
-        response.headers.add('Access-Control-Allow-Methods', "*")
-        return response
-    
     try:
         status = {
             'status': 'healthy',
@@ -195,17 +179,8 @@ def health():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-@app.route('/transcribe', methods=['POST', 'OPTIONS'])
-@cross_origin()
+@app.route('/transcribe', methods=['POST'])
 def transcribe():
-    # Handle preflight
-    if request.method == 'OPTIONS':
-        response = make_response()
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add('Access-Control-Allow-Headers', "*")
-        response.headers.add('Access-Control-Allow-Methods', "*")
-        return response
-    
     try:
         logger.info("Transcription request received")
         
@@ -263,28 +238,15 @@ def transcribe():
         logger.error(traceback.format_exc())
         return jsonify({'error': f'Request failed: {str(e)}'}), 500
 
-# Add explicit CORS headers to all responses
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,Origin,X-Requested-With')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-    response.headers.add('Access-Control-Max-Age', '86400')
-    return response
-
 # Error handlers
 @app.errorhandler(404)
 def not_found(error):
-    response = jsonify({'error': 'Not found'})
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    return response, 404
+    return jsonify({'error': 'Not found'}), 404
 
 @app.errorhandler(500)
 def internal_error(error):
     logger.error(f"Internal error: {error}")
-    response = jsonify({'error': 'Internal server error'})
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    return response, 500
+    return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == '__main__':
     try:
