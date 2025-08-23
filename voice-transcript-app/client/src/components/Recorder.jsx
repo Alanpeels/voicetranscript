@@ -16,14 +16,13 @@ export default function Recorder() {
     try {
       setError(null);
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      
+
       const mimeType = "audio/webm;codecs=opus";
       mediaRef.current = new MediaRecorder(stream, { mimeType });
       audioChunks.current = [];
       mediaRef.current.ondataavailable = (e) => audioChunks.current.push(e.data);
       mediaRef.current.start();
       setStatus("recording");
-      console.log(`Recording started with format: ${mimeType}`);
     } catch (err) {
       setError("Failed to start recording: " + err.message);
     }
@@ -40,36 +39,33 @@ export default function Recorder() {
   const convertWebmToWav = async (webmBlob) => {
     try {
       const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      
       const arrayBuffer = await webmBlob.arrayBuffer();
       const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-      
+
       const targetSampleRate = 16000;
       const targetBuffer = audioContext.createBuffer(
         audioBuffer.numberOfChannels,
         Math.round(audioBuffer.length * targetSampleRate / audioBuffer.sampleRate),
         targetSampleRate
       );
-      
+
       for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
         const sourceData = audioBuffer.getChannelData(channel);
         const targetData = targetBuffer.getChannelData(channel);
-        
+
         for (let i = 0; i < targetData.length; i++) {
           const sourceIndex = (i * audioBuffer.sampleRate) / targetSampleRate;
           const sourceIndexFloor = Math.floor(sourceIndex);
           const sourceIndexCeil = Math.min(sourceIndexFloor + 1, sourceData.length - 1);
           const fraction = sourceIndex - sourceIndexFloor;
-          
+
           targetData[i] = sourceData[sourceIndexFloor] * (1 - fraction) + sourceData[sourceIndexCeil] * fraction;
         }
       }
-      
-      const wavBlob = audioBufferToWav(targetBuffer);
-      return wavBlob;
-      
-    } catch (error) {
-      console.error("Audio conversion failed:", error);
+
+      return audioBufferToWav(targetBuffer);
+    } catch (err) {
+      console.error("Audio conversion failed:", err);
       return webmBlob;
     }
   };
@@ -80,17 +76,17 @@ export default function Recorder() {
     const sampleRate = buffer.sampleRate;
     const arrayBuffer = new ArrayBuffer(44 + length * numberOfChannels * 2);
     const view = new DataView(arrayBuffer);
-    
+
     const writeString = (offset, string) => {
       for (let i = 0; i < string.length; i++) {
         view.setUint8(offset + i, string.charCodeAt(i));
       }
     };
-    
-    writeString(0, 'RIFF');
+
+    writeString(0, "RIFF");
     view.setUint32(4, 36 + length * numberOfChannels * 2, true);
-    writeString(8, 'WAVE');
-    writeString(12, 'fmt ');
+    writeString(8, "WAVE");
+    writeString(12, "fmt ");
     view.setUint32(16, 16, true);
     view.setUint16(20, 1, true);
     view.setUint16(22, numberOfChannels, true);
@@ -98,29 +94,26 @@ export default function Recorder() {
     view.setUint32(28, sampleRate * numberOfChannels * 2, true);
     view.setUint16(32, numberOfChannels * 2, true);
     view.setUint16(34, 16, true);
-    writeString(36, 'data');
+    writeString(36, "data");
     view.setUint32(40, length * numberOfChannels * 2, true);
-    
+
     let offset = 44;
     for (let i = 0; i < length; i++) {
       for (let channel = 0; channel < numberOfChannels; channel++) {
         const sample = Math.max(-1, Math.min(1, buffer.getChannelData(channel)[i]));
-        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
         offset += 2;
       }
     }
-    
-    return new Blob([arrayBuffer], { type: 'audio/wav' });
+
+    return new Blob([arrayBuffer], { type: "audio/wav" });
   };
 
   const uploadAudio = async () => {
     try {
       const webmBlob = new Blob(audioChunks.current, { type: "audio/webm" });
-      
-      console.log("Converting WebM to WAV...");
       const wavBlob = await convertWebmToWav(webmBlob);
-      console.log("Conversion completed, WAV size:", wavBlob.size);
-      
+
       const formData = new FormData();
       formData.append("audio", wavBlob, `rec_${Date.now()}.wav`);
 
@@ -129,26 +122,31 @@ export default function Recorder() {
         body: formData,
       });
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Backend error: ${response.status} - ${errorText}`);
-      }
-
       const data = await response.json();
+
+      if (!response.ok) {
+        // Handle model loading separately
+        if (data.status === "model_loading") {
+          setError(`Model is loading. Please wait ${data.retry_after_seconds || 30}s and try again.`);
+          setStatus("idle");
+          return;
+        }
+        throw new Error(data.error || `Backend error: ${response.status}`);
+      }
 
       if (data.success) {
         setTranscript(data.transcript);
         setWordTimestamps(data.word_timestamps || []);
-        
+
         try {
           const { data: { user } } = await supabase.auth.getUser();
           if (user) {
             await supabase.from("transcripts").insert({
               user_id: user.id,
-              audio_filename: data.audio_filename,
+              audio_filename: data.audio_filename || `rec_${Date.now()}.wav`,
               transcript_text: data.transcript,
               word_timestamps: JSON.stringify(data.word_timestamps),
-              created_at: new Date().toISOString()
+              created_at: new Date().toISOString(),
             });
           }
         } catch (dbError) {
@@ -178,32 +176,28 @@ export default function Recorder() {
         <button
           disabled={status !== "idle"}
           className={`px-4 py-2 rounded font-medium transition-colors ${
-            status === "idle" 
-              ? "bg-blue-500 hover:bg-blue-600 text-white" 
-              : "bg-gray-300 text-gray-500 cursor-not-allowed"
+            status === "idle" ? "bg-blue-500 hover:bg-blue-600 text-white" : "bg-gray-300 text-gray-500 cursor-not-allowed"
           }`}
           onClick={startRecording}
         >
           {status === "idle" ? "🎤 Add Recording" : "⏸️ Recording..."}
         </button>
-        
+
         <button
           disabled={status !== "recording"}
           className={`px-4 py-2 rounded font-medium transition-colors ${
-            status === "recording" 
-              ? "bg-red-500 hover:bg-red-600 text-white" 
-              : "bg-gray-300 text-gray-500 cursor-not-allowed"
+            status === "recording" ? "bg-red-500 hover:bg-red-600 text-white" : "bg-gray-300 text-gray-500 cursor-not-allowed"
           }`}
           onClick={stopRecording}
         >
-          {status === "idle" ? "⏹️ Stop Recording" : "⏹️ Stop"}
+          ⏹️ Stop
         </button>
 
         {transcript && (
           <button
             className="px-4 py-2 bg-gray-500 hover:bg-gray-600 text-white rounded font-medium transition-colors"
             onClick={resetRecording}
-        >
+          >
             🔄 New Recording
           </button>
         )}
@@ -225,7 +219,6 @@ export default function Recorder() {
       {transcript && (
         <div className="border border-gray-200 p-4 rounded-lg bg-white shadow-sm">
           <h3 className="font-semibold mb-3 text-lg text-gray-800">Word-level Transcript</h3>
-          
           <div className="mb-4 p-3 bg-gray-50 rounded">
             <p className="text-gray-700">{transcript}</p>
           </div>
@@ -235,8 +228,8 @@ export default function Recorder() {
               <h4 className="font-medium mb-2 text-gray-700">Words with Timestamps:</h4>
               <div className="flex flex-wrap gap-2">
                 {wordTimestamps.map((word, i) => (
-                  <span 
-                    key={i} 
+                  <span
+                    key={i}
                     className="bg-blue-100 text-blue-800 px-2 py-1 rounded text-sm font-medium"
                     title={`${word.start}s - ${word.end}s`}
                   >
