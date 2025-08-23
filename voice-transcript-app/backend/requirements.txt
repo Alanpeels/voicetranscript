@@ -1,11 +1,9 @@
+# Try this if the full version still fails
 flask==3.1.2
-flask-cors==4.0.0   # or 3.0.10 if you want older
+flask-cors==4.0.0
 gunicorn==23.0.0
-torch==2.2.0
-torchaudio==2.2.0
-transformers==4.35.0
-librosa==0.10.1
+torch==2.0.1+cpu  # CPU-only version
+transformers==4.30.0  # Older, more stable version
+librosa==0.9.2  # Lighter version
 numpy==1.24.4
-scipy==1.11.4
 soundfile==0.12.1
-psutil==5.9.5
