@@ -122,8 +122,7 @@ def load_model():
                 model = Wav2Vec2ForCTC.from_pretrained(
                     model_name,
                     cache_dir="/tmp/huggingface_cache",
-                    torch_dtype=torch.float32,
-                    low_cpu_mem_usage=True
+                    torch_dtype=torch.float32
                 )
                 model.eval()
                 logger.info("Model loaded")
@@ -222,7 +221,7 @@ def handle_preflight():
 def home():
     return jsonify({
         'message': 'Wav2Vec2 ASR API',
-        'endpoints': ['/transcribe', '/health'],
+        'endpoints': ['/transcribe', '/health', '/warmup'],
         'status': 'running',
         'model_loaded': model_loaded,
         'version': '2.0'
@@ -258,6 +257,55 @@ def health():
         return jsonify({
             'status': 'error', 
             'message': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 500
+
+@app.route('/warmup', methods=['POST', 'GET'])
+def warmup():
+    """Endpoint to pre-load the model"""
+    try:
+        logger.info("Warmup request received - loading model...")
+        
+        if model_loaded:
+            return jsonify({
+                'status': 'already_loaded',
+                'message': 'Model is already loaded and ready',
+                'model_loaded': True,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        
+        if model_loading:
+            return jsonify({
+                'status': 'loading',
+                'message': 'Model is currently loading, please wait...',
+                'model_loading': True,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        
+        # Start loading
+        success = load_model()
+        
+        if success:
+            return jsonify({
+                'status': 'success',
+                'message': 'Model loaded successfully and ready for transcription',
+                'model_loaded': True,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': f'Model loading failed: {model_error}',
+                'model_loaded': False,
+                'model_error': model_error,
+                'timestamp': datetime.utcnow().isoformat()
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"Warmup error: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': f'Warmup failed: {str(e)}',
             'timestamp': datetime.utcnow().isoformat()
         }), 500
 
