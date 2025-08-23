@@ -1,15 +1,22 @@
+# render.yaml (create this file in your project root)
 services:
   - type: web
-    name: voice-transcript-backend
+    name: voicetranscript
     env: python
-    plan: free
-    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
-    startCommand: "gunicorn -c gunicorn.conf.py app:app"
-    healthCheckPath: /health
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300 --worker-class sync --max-requests 100 --preload
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
-      - key: PYTHONUNBUFFERED
-        value: 1
-      - key: WEB_CONCURRENCY
-        value: 1
+      - key: PYTHONPATH
+        value: /opt/render/project/src
+      - key: HF_HOME
+        value: /tmp/huggingface_cache
+      - key: TRANSFORMERS_CACHE
+        value: /tmp/huggingface_cache
+      - key: HF_DATASETS_CACHE
+        value: /tmp/huggingface_cache
+
+---
+
+# Alternative gunicorn command for your current setup:
+# Update your Render service start command to:
+gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300 --worker-class sync --max-requests 100 --preload

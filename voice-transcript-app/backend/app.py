@@ -5,8 +5,10 @@ import logging
 import traceback
 from datetime import datetime
 import sqlite3
+import threading
+import time
 
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 # Set up proper logging
@@ -19,20 +21,29 @@ logger = logging.getLogger(__name__)
 # Create Flask app
 app = Flask(__name__)
 
-# Simplified CORS configuration - this is the most important fix
-CORS(app, resources={
-    r"/*": {
-        "origins": "*",
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"]
+# Very explicit CORS configuration
+app.config.update(
+    CORS_HEADERS='Content-Type',
+    CORS_RESOURCES={
+        r"/*": {
+            "origins": "*",
+            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With", "Access-Control-Request-Method", "Access-Control-Request-Headers"],
+            "expose_headers": ["Content-Type"],
+            "supports_credentials": False,
+            "max_age": 600
+        }
     }
-})
+)
+CORS(app, resources=app.config['CORS_RESOURCES'])
 
 # Global model variables
 processor = None
 model = None
 model_loaded = False
 model_error = None
+model_loading = False
+model_load_lock = threading.Lock()
 
 def init_db():
     """Initialize SQLite database"""
@@ -57,59 +68,87 @@ def clear_memory():
     gc.collect()
 
 def load_model():
-    """Load Wav2Vec2 model with better error handling"""
-    global processor, model, model_loaded, model_error
+    """Load Wav2Vec2 model with lazy loading and timeout handling"""
+    global processor, model, model_loaded, model_error, model_loading
     
-    if model_loaded:
-        return True
-    
-    try:
-        logger.info("Starting model load...")
+    with model_load_lock:
+        if model_loaded:
+            return True
         
-        # Try to load transformers
-        try:
-            from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
-            import torch
-        except ImportError as e:
-            model_error = f"Import failed: {e}"
-            logger.error(model_error)
+        if model_loading:
+            # Wait for ongoing loading (max 60 seconds)
+            for _ in range(60):
+                time.sleep(1)
+                if model_loaded:
+                    return True
+                if not model_loading:
+                    break
             return False
         
-        model_name = "facebook/wav2vec2-base-960h"
-        logger.info(f"Loading {model_name}...")
+        model_loading = True
         
-        # Load with explicit error handling
         try:
-            processor = Wav2Vec2Processor.from_pretrained(model_name)
-            logger.info("Processor loaded")
+            logger.info("Starting model load...")
+            
+            # Try to load transformers
+            try:
+                from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
+                import torch
+                logger.info("Transformers imported successfully")
+            except ImportError as e:
+                model_error = f"Import failed: {e}"
+                logger.error(model_error)
+                model_loading = False
+                return False
+            
+            model_name = "facebook/wav2vec2-base-960h"
+            logger.info(f"Loading {model_name}...")
+            
+            # Load processor first (lighter)
+            try:
+                processor = Wav2Vec2Processor.from_pretrained(
+                    model_name,
+                    cache_dir="/tmp/huggingface_cache"
+                )
+                logger.info("Processor loaded")
+            except Exception as e:
+                model_error = f"Processor load failed: {e}"
+                logger.error(model_error)
+                model_loading = False
+                return False
+            
+            # Load model with memory optimization
+            try:
+                model = Wav2Vec2ForCTC.from_pretrained(
+                    model_name,
+                    cache_dir="/tmp/huggingface_cache",
+                    torch_dtype=torch.float32,
+                    low_cpu_mem_usage=True
+                )
+                model.eval()
+                logger.info("Model loaded")
+            except Exception as e:
+                model_error = f"Model load failed: {e}"
+                logger.error(model_error)
+                model_loading = False
+                return False
+            
+            model_loaded = True
+            model_loading = False
+            logger.info("Model loading complete!")
+            return True
+            
         except Exception as e:
-            model_error = f"Processor load failed: {e}"
-            logger.error(model_error)
+            model_error = f"Unexpected error: {e}"
+            logger.error(f"Model load failed: {e}")
+            logger.error(traceback.format_exc())
+            model_loading = False
             return False
-        
-        try:
-            model = Wav2Vec2ForCTC.from_pretrained(model_name)
-            model.eval()
-            logger.info("Model loaded")
-        except Exception as e:
-            model_error = f"Model load failed: {e}"
-            logger.error(model_error)
-            return False
-        
-        model_loaded = True
-        logger.info("Model loading complete!")
-        return True
-        
-    except Exception as e:
-        model_error = f"Unexpected error: {e}"
-        logger.error(f"Model load failed: {e}")
-        logger.error(traceback.format_exc())
-        return False
 
 def simple_transcribe(audio_bytes):
-    """Simple transcription function"""
+    """Simple transcription function with better error handling"""
     try:
-        # Try to load required libraries
+        # Load required libraries
         import librosa
         import torch
         import numpy as np
@@ -117,39 +156,76 @@ def simple_transcribe(audio_bytes):
         if not load_model():
             raise Exception(f"Model not available: {model_error}")
         
-        # Process audio
         logger.info("Processing audio...")
-        audio_array, sr = librosa.load(io.BytesIO(audio_bytes), sr=16000, duration=30)
-        logger.info(f"Audio processed: {len(audio_array)} samples")
+        # Process audio with error handling
+        try:
+            audio_array, sr = librosa.load(
+                io.BytesIO(audio_bytes), 
+                sr=16000, 
+                duration=30,
+                mono=True
+            )
+            logger.info(f"Audio processed: {len(audio_array)} samples at {sr}Hz")
+        except Exception as e:
+            logger.error(f"Audio processing failed: {e}")
+            raise Exception("Failed to process audio file")
         
-        # Transcribe
+        if len(audio_array) == 0:
+            return "[No audio detected]"
+        
+        # Transcribe with timeout protection
         logger.info("Running inference...")
-        inputs = processor(audio_array, sampling_rate=sr, return_tensors="pt", padding=True)
-        
-        with torch.no_grad():
-            logits = model(inputs.input_values).logits
-        
-        predicted_ids = torch.argmax(logits, dim=-1)
-        transcript = processor.batch_decode(predicted_ids)[0]
-        
-        # Clean up
-        del inputs, logits, predicted_ids
-        clear_memory()
-        
-        return transcript.strip() if transcript.strip() else "[No speech detected]"
+        try:
+            inputs = processor(
+                audio_array, 
+                sampling_rate=sr, 
+                return_tensors="pt", 
+                padding=True
+            )
+            
+            with torch.no_grad():
+                logits = model(inputs.input_values).logits
+            
+            predicted_ids = torch.argmax(logits, dim=-1)
+            transcript = processor.batch_decode(predicted_ids)[0]
+            
+            # Clean up tensors
+            del inputs, logits, predicted_ids
+            clear_memory()
+            
+            result = transcript.strip() if transcript.strip() else "[No speech detected]"
+            logger.info(f"Transcription successful: {len(result)} characters")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Inference failed: {e}")
+            clear_memory()
+            raise Exception(f"Transcription inference failed: {str(e)}")
         
     except Exception as e:
         logger.error(f"Transcription failed: {e}")
         clear_memory()
         raise
 
-# Routes - simplified without manual CORS handling
+# Add explicit OPTIONS handler
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = jsonify({})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add('Access-Control-Allow-Headers', "Content-Type,Authorization,Accept,Origin,X-Requested-With")
+        response.headers.add('Access-Control-Allow-Methods', "GET,POST,PUT,DELETE,OPTIONS")
+        return response
+
+# Routes
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
         'message': 'Wav2Vec2 ASR API',
         'endpoints': ['/transcribe', '/health'],
-        'status': 'running'
+        'status': 'running',
+        'model_loaded': model_loaded,
+        'version': '2.0'
     })
 
 @app.route('/health', methods=['GET'])
@@ -158,7 +234,9 @@ def health():
         status = {
             'status': 'healthy',
             'model_loaded': model_loaded,
-            'model_error': model_error
+            'model_loading': model_loading,
+            'model_error': model_error,
+            'timestamp': datetime.utcnow().isoformat()
         }
         
         # Add memory info if available
@@ -172,25 +250,29 @@ def health():
                 'process_memory': f"{process.memory_info().rss/1024**2:.1f}MB"
             })
         except:
-            pass
+            status['memory_info'] = 'unavailable'
             
         return jsonify(status)
         
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        return jsonify({
+            'status': 'error', 
+            'message': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 500
 
 @app.route('/transcribe', methods=['POST'])
 def transcribe():
     try:
         logger.info("Transcription request received")
         
-        # Check for audio file
+        # Validate request
         if 'audio' not in request.files:
             logger.error("No audio file in request")
             return jsonify({'error': 'No audio file provided'}), 400
         
         audio_file = request.files['audio']
-        if not audio_file:
+        if not audio_file or not audio_file.filename:
             return jsonify({'error': 'Empty audio file'}), 400
         
         # Read audio data
@@ -199,39 +281,50 @@ def transcribe():
             return jsonify({'error': 'Empty audio data'}), 400
         
         # Size check
-        if len(audio_bytes) > 10 * 1024 * 1024:  # 10MB
-            return jsonify({'error': 'File too large (max 10MB)'}), 400
+        max_size = 10 * 1024 * 1024  # 10MB
+        if len(audio_bytes) > max_size:
+            return jsonify({'error': f'File too large (max {max_size//1024//1024}MB)'}), 400
         
         logger.info(f"Processing audio: {len(audio_bytes)} bytes")
         
-        # Transcribe
+        # Quick model availability check
+        if not model_loaded and not model_loading:
+            logger.info("Model not loaded, triggering load...")
+        
+        # Transcribe with error handling
         try:
             transcript = simple_transcribe(audio_bytes)
-            logger.info(f"Transcription result: {transcript}")
+            logger.info(f"Transcription completed: {transcript[:100]}...")
             
             # Create response
             response_data = {
                 'success': True,
                 'transcript': transcript,
                 'word_count': len(transcript.split()) if transcript != "[No speech detected]" else 0,
-                'model_used': 'wav2vec2-base-960h'
+                'audio_size_bytes': len(audio_bytes),
+                'model_used': 'wav2vec2-base-960h',
+                'timestamp': datetime.utcnow().isoformat()
             }
             
-            # Save to database
+            # Save to database (non-blocking)
             try:
-                conn = sqlite3.connect('transcripts.db')
+                conn = sqlite3.connect('transcripts.db', timeout=5.0)
                 cursor = conn.cursor()
                 cursor.execute("INSERT INTO transcripts (transcript_text) VALUES (?)", (transcript,))
                 conn.commit()
                 conn.close()
             except Exception as db_err:
-                logger.warning(f"DB save failed: {db_err}")
+                logger.warning(f"DB save failed (non-critical): {db_err}")
             
             return jsonify(response_data)
             
         except Exception as transcribe_error:
             logger.error(f"Transcription error: {transcribe_error}")
-            return jsonify({'error': f'Transcription failed: {str(transcribe_error)}'}), 500
+            return jsonify({
+                'error': f'Transcription failed: {str(transcribe_error)}',
+                'model_loaded': model_loaded,
+                'model_loading': model_loading
+            }), 500
         
     except Exception as e:
         logger.error(f"Request processing error: {e}")
@@ -241,12 +334,25 @@ def transcribe():
 # Error handlers
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({'error': 'Not found'}), 404
+    return jsonify({'error': 'Endpoint not found'}), 404
 
 @app.errorhandler(500)
 def internal_error(error):
     logger.error(f"Internal error: {error}")
     return jsonify({'error': 'Internal server error'}), 500
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({'error': 'File too large'}), 413
+
+# Add response headers for all responses
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,Origin,X-Requested-With')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Max-Age', '600')
+    return response
 
 if __name__ == '__main__':
     try:
@@ -254,14 +360,18 @@ if __name__ == '__main__':
         port = int(os.environ.get('PORT', 5000))
         logger.info(f"Starting server on port {port}")
         
-        # Test model loading on startup (optional)
-        logger.info("Testing model availability...")
-        if load_model():
-            logger.info("Model is ready!")
-        else:
-            logger.warning(f"Model not ready: {model_error}")
+        # Pre-load model in background thread (optional)
+        def background_model_load():
+            logger.info("Starting background model load...")
+            if load_model():
+                logger.info("Background model load successful!")
+            else:
+                logger.warning(f"Background model load failed: {model_error}")
         
-        app.run(host='0.0.0.0', port=port, debug=False)
+        # Start background loading
+        threading.Thread(target=background_model_load, daemon=True).start()
+        
+        app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
         
     except Exception as e:
         logger.error(f"Server start failed: {e}")
