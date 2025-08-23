@@ -1,5 +1,5 @@
 import React, { useRef, useState } from "react";
-import { supabase } from "../supabaseClient";
+import { supabase } from "../supabaseClient.js";
 import { WHISPER_BACKEND_URL } from "../config";
 
 export default function Recorder() {
