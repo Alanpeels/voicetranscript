@@ -1,6 +1,6 @@
 import React, { useRef, useState } from "react";
-import { supabase } from "../supabaseClient.js";
-import { WHISPER_BACKEND_URL } from "../config";
+import { supabase } from "../supabaseClient";
+import { WHISPER_BACKEND_URL } from "../econfig";
 
 export default function Recorder() {
   const [recording, setRecording] = useState(false);
