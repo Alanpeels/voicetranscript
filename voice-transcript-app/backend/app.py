@@ -117,13 +117,9 @@ def load_model():
                 model_loading = False
                 return False
             
-            # Load model with memory optimization
+            # Load model with basic settings
             try:
-                model = Wav2Vec2ForCTC.from_pretrained(
-                    model_name,
-                    cache_dir="/tmp/huggingface_cache",
-                    torch_dtype=torch.float32
-                )
+                model = Wav2Vec2ForCTC.from_pretrained(model_name)
                 model.eval()
                 logger.info("Model loaded")
             except Exception as e:
@@ -206,14 +202,15 @@ def simple_transcribe(audio_bytes):
         clear_memory()
         raise
 
-# Add explicit OPTIONS handler
+# Add explicit OPTIONS handler for all routes
 @app.before_request
 def handle_preflight():
     if request.method == "OPTIONS":
-        response = jsonify({})
+        response = make_response()
         response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add('Access-Control-Allow-Headers', "Content-Type,Authorization,Accept,Origin,X-Requested-With")
+        response.headers.add('Access-Control-Allow-Headers', "Content-Type,Authorization,Accept,Origin,X-Requested-With,Access-Control-Request-Method,Access-Control-Request-Headers")
         response.headers.add('Access-Control-Allow-Methods', "GET,POST,PUT,DELETE,OPTIONS")
+        response.headers.add('Access-Control-Max-Age', '600')
         return response
 
 # Routes
@@ -335,9 +332,27 @@ def transcribe():
         
         logger.info(f"Processing audio: {len(audio_bytes)} bytes")
         
-        # Quick model availability check
+        # Check model status and provide immediate feedback
         if not model_loaded and not model_loading:
             logger.info("Model not loaded, triggering load...")
+            return jsonify({
+                'success': False,
+                'status': 'model_loading',
+                'message': 'Model is loading for the first time. This takes 30-60 seconds. Please try again in a moment.',
+                'model_loaded': False,
+                'model_loading': True,
+                'retry_after_seconds': 45
+            }), 202  # 202 = Accepted, processing
+        
+        if model_loading:
+            return jsonify({
+                'success': False,
+                'status': 'model_loading',
+                'message': 'Model is currently loading. Please wait and try again.',
+                'model_loaded': False,
+                'model_loading': True,
+                'retry_after_seconds': 30
+            }), 202
         
         # Transcribe with error handling
         try:
@@ -369,6 +384,7 @@ def transcribe():
         except Exception as transcribe_error:
             logger.error(f"Transcription error: {transcribe_error}")
             return jsonify({
+                'success': False,
                 'error': f'Transcription failed: {str(transcribe_error)}',
                 'model_loaded': model_loaded,
                 'model_loading': model_loading
@@ -377,7 +393,10 @@ def transcribe():
     except Exception as e:
         logger.error(f"Request processing error: {e}")
         logger.error(traceback.format_exc())
-        return jsonify({'error': f'Request failed: {str(e)}'}), 500
+        return jsonify({
+            'success': False,
+            'error': f'Request failed: {str(e)}'
+        }), 500
 
 # Error handlers
 @app.errorhandler(404)
@@ -393,13 +412,14 @@ def internal_error(error):
 def request_entity_too_large(error):
     return jsonify({'error': 'File too large'}), 413
 
-# Add response headers for all responses
+# Add response headers for all responses - this is crucial
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,Origin,X-Requested-With')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,Origin,X-Requested-With,Access-Control-Request-Method,Access-Control-Request-Headers')
     response.headers.add('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
     response.headers.add('Access-Control-Max-Age', '600')
+    response.headers.add('Access-Control-Allow-Credentials', 'false')
     return response
 
 if __name__ == '__main__':
@@ -408,15 +428,16 @@ if __name__ == '__main__':
         port = int(os.environ.get('PORT', 5000))
         logger.info(f"Starting server on port {port}")
         
-        # Pre-load model in background thread (optional)
+        # Pre-load model in background thread (enabled by default)
         def background_model_load():
             logger.info("Starting background model load...")
+            time.sleep(5)  # Give server time to start
             if load_model():
                 logger.info("Background model load successful!")
             else:
                 logger.warning(f"Background model load failed: {model_error}")
         
-        # Start background loading
+        # Start background loading immediately
         threading.Thread(target=background_model_load, daemon=True).start()
         
         app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
